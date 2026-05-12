@@ -10,8 +10,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Development Practices
 
+### TDD — mandatory, not optional
+
+**Do not write a single line of implementation without a failing test first.** This is the non-negotiable workflow:
+
+1. Write a test that describes the desired behaviour and fails (red).
+2. Write the minimum implementation to make it pass (green).
+3. Refactor. Commit.
+
+Skipping to step 2 is the single most common mistake in this repo — do not do it.
+
+**Before implementing any function, class, or module, explicitly list the test cases you will cover, including:**
+- Happy path
+- Edge cases specific to this project: malformed/truncated JSON, unknown `schema_version`, missing `sensor_id`, OTLP batch with multiple sensors, late-arriving events (timestamp in the past), duplicate `(sensor_id, time)` pairs
+- Error paths: what should happen (log + skip, not crash)
+
+**Test file locations:**
+- Flink (Java): `flink/src/test/java/com/example/` — JUnit 5, run with `mvn test`
+- Rust gateway: inline `#[cfg(test)]` modules in `gateway/src/main.rs` — run with `cargo test`
+- Python firmware: `firmware/tests/` — pytest, run with `pytest firmware/tests/`
+
+**No implementation PR is complete without tests.** A commit that adds implementation without a corresponding test commit is incomplete.
+
+### Other practices
+
 - **Commits:** Small, focused changesets; commit after each logical step with a message tied to the feature or validation checkpoint (e.g. `feat(flink): RawSinkJob reads from Kafka source — checkpoint 3.1`).
-- **TDD:** Write a failing test first, then implement. Cover edge cases (late-arriving events, malformed JSON, duplicate sensor IDs) not just the happy path — nominate edge cases explicitly before implementing.
 - **Dependency injection:** Pass dependencies (Kafka config, JDBC connections, clocks) via constructors or interfaces so tests can substitute fakes without I/O.
 - **Comments:** This is a learning project — add comments explaining the *why* and relevant concepts (e.g. why event time vs processing time, what a watermark does), not just what the code does.
 - **Mock sensors:** Use `mock_sensor.py` throughout all pipeline development phases. Do not wait for real ESP32 hardware to build or test any pipeline component.
