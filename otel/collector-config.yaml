@@ -1,0 +1,56 @@
+# collector-config.yaml — OTel Collector pipeline configuration
+#
+# Role: receive OTLP metrics from the Rust gateway → export to Kafka as OTLP protobuf.
+# The collector does NOT subscribe to MQTT (that is the gateway's responsibility per ADR 003).
+# No transform processors are applied — the gateway already produces well-typed OTLP gauges.
+#
+# Pipeline:
+#   otlp receiver (gRPC :4317)
+#     └── kafka exporter (topic: raw-temperature, encoding: otlp_proto)
+#
+# To inspect resource attributes during development, temporarily add the 'logging'
+# exporter to the metrics/exporters list — it prints decoded OTLP to collector stdout.
+
+extensions:
+  # health_check exposes GET /healthz on port 13133.
+  # The otel-collector service in docker-compose.yml probes this endpoint.
+  health_check:
+    endpoint: "0.0.0.0:13133"
+
+receivers:
+  otlp:
+    # Accepts OTLP metrics from the Rust gateway via gRPC.
+    # The gateway connects to otel-collector:4317 on the Docker telemetry network.
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+
+exporters:
+  kafka:
+    # Exports OTLP metrics to Kafka using the otlp_proto encoding.
+    # otlp_proto: each Kafka message is a serialized ExportMetricsServiceRequest
+    # protobuf — the same format Flink's RawSinkJob deserializes on the other end.
+    # Flink then flatMaps each ExportMetricsServiceRequest into individual SensorReading events.
+    brokers:
+      - kafka:29092           # internal Docker network address (not localhost:9092)
+    topic: raw-temperature
+    encoding: otlp_proto
+    # producer settings tuned for a low-throughput dev pipeline
+    producer:
+      max_message_bytes: 1000000
+      required_acks: 1        # leader ack only (sufficient for single-broker dev)
+
+  # logging exporter — useful for validating resource attributes (sensor_id, room)
+  # without a Kafka consumer. Add to the metrics/exporters list below to enable.
+  logging:
+    verbosity: detailed        # 'detailed' prints metric name, value, and all attributes
+
+service:
+  extensions: [health_check]
+
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      # Add 'logging' here temporarily to inspect incoming OTLP during development:
+      #   exporters: [kafka, logging]
+      exporters: [kafka]
