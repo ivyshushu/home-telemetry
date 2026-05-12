@@ -1,0 +1,264 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!--
+    Maven coordinates — group + artifact + version uniquely identify this JAR
+    in any Maven repository. We version it "1.0-SNAPSHOT" to indicate it is
+    still under active development (SNAPSHOT = not yet a stable release).
+  -->
+  <groupId>com.example</groupId>
+  <artifactId>flink-jobs</artifactId>
+  <version>1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+  <name>Room Temperature Telemetry — Flink Jobs</name>
+
+  <properties>
+    <!--
+      All three Flink jobs compile against Flink 1.18.1, the same version
+      that runs inside the flink:1.18-java11 Docker image. If these differ,
+      you may see NoClassDefFoundError or API incompatibility at runtime.
+    -->
+    <flink.version>1.18.1</flink.version>
+
+    <!--
+      Java 11 is required by Flink 1.18's recommended runtime. Java 17+ works
+      but needs extra JVM flags for module access; we stay on 11 to match the
+      official flink:1.18-java11 image and avoid that complexity.
+    -->
+    <java.version>11</java.version>
+    <maven.compiler.source>${java.version}</maven.compiler.source>
+    <maven.compiler.target>${java.version}</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+
+    <!-- =====================================================================
+         FLINK CORE (scope=provided)
+         ===================================================================
+         "provided" means Maven compiles against these JARs but does NOT bundle
+         them into our fat JAR. At runtime, the Flink cluster (JobManager /
+         TaskManager) already has them on the classpath. Bundling them would
+         create a bloated JAR and risk version conflicts with the cluster's own
+         Flink classes.
+
+         flink-streaming-java  — the core DataStream API (StreamExecutionEnvironment,
+                                 DataStream, keyBy, window, process, etc.)
+         flink-clients         — the FlinkClient used by `flink run` to submit
+                                 the JAR to the JobManager; also needed for
+                                 ClusterClient in tests.
+    ================================================================= -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-streaming-java</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-clients</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- SLF4J API — logging facade; the Flink cluster provides its own impl.
+         We declare it provided so we can call LOG.info(...) in our code. -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>2.0.9</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Log4j → SLF4J bridge so log statements in our code appear in Flink's
+         log files. Runtime scope: included in the fat JAR (the Flink image
+         ships log4j2 but we bundle the binding just in case). -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-slf4j2-impl</artifactId>
+      <version>2.22.1</version>
+      <scope>runtime</scope>
+    </dependency>
+
+    <!-- =====================================================================
+         FLINK KAFKA CONNECTOR (scope=compile → bundled)
+         ===================================================================
+         NOT provided — the Flink distribution does not ship Kafka connectors
+         out of the box. We must bundle it in our fat JAR.
+
+         The version string "3.1.0-1.18" means:
+           connector version 3.1.0 built for Flink 1.18.
+         It includes KafkaSource (new source API with offsets, watermarks,
+         topic discovery) and KafkaSink (new sink API with semantic options).
+    ================================================================= -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-connector-kafka</artifactId>
+      <version>3.1.0-1.18</version>
+    </dependency>
+
+    <!-- =====================================================================
+         FLINK JDBC CONNECTOR (scope=compile → bundled)
+         ===================================================================
+         Provides JdbcSink.sink(...) with batching and retry semantics.
+         "3.1.2-1.18" = connector 3.1.2 for Flink 1.18.
+         Also NOT in the Flink distribution — must be bundled.
+    ================================================================= -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-connector-jdbc</artifactId>
+      <version>3.1.2-1.18</version>
+    </dependency>
+
+    <!-- =====================================================================
+         POSTGRESQL JDBC DRIVER (scope=compile → bundled)
+         ===================================================================
+         The actual wire-protocol driver that sends SQL to TimescaleDB.
+         TimescaleDB is 100% PostgreSQL-wire-compatible so the standard
+         org.postgresql driver works without any TimescaleDB-specific jar.
+    ================================================================= -->
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <version>42.7.3</version>
+    </dependency>
+
+    <!-- =====================================================================
+         OPENTELEMETRY PROTOBUF BINDINGS (scope=compile → bundled)
+         ===================================================================
+         The OTel Collector's Kafka exporter writes messages in "otlp_proto"
+         encoding: each Kafka record is a binary-serialised
+         ExportMetricsServiceRequest proto message.
+
+         This library (opentelemetry-proto) ships the Java protobuf-generated
+         classes for the OTLP metrics proto schema. We call
+         ExportMetricsServiceRequest.parseFrom(bytes) in OtlpDeserializer.
+
+         "1.1.0-alpha" is the latest stable proto-bindings release as of 2024.
+         The "-alpha" suffix refers to the library maturity label, not the
+         protobuf schema stability; the schema itself is stable.
+    ================================================================= -->
+    <dependency>
+      <groupId>io.opentelemetry.proto</groupId>
+      <artifactId>opentelemetry-proto</artifactId>
+      <version>1.1.0-alpha</version>
+    </dependency>
+
+    <!-- =====================================================================
+         JACKSON (scope=compile → bundled)
+         ===================================================================
+         Used by AggregationJob and AlertJob to serialize/deserialize
+         WindowResult and AlertEvent POJOs as JSON when writing to / reading
+         from Kafka topics (temperature-processed, temperature-alerts).
+
+         Jackson is the de-facto standard Java JSON library. ObjectMapper is
+         thread-safe after configuration so we instantiate it once as a static
+         field in each serializer/deserializer class.
+    ================================================================= -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.17.0</version>
+    </dependency>
+
+  </dependencies>
+
+  <build>
+    <plugins>
+
+      <!--
+        Maven Compiler Plugin — enforces Java 11 source/target. Without this,
+        Maven would default to Java 5 (!) for compatibility. Source and target
+        must match the JDK in the Docker build image (eclipse-temurin-11).
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.12.1</version>
+        <configuration>
+          <source>${java.version}</source>
+          <target>${java.version}</target>
+        </configuration>
+      </plugin>
+
+      <!--
+        Maven Shade Plugin — packages everything into one "fat JAR" (also called
+        an "uber JAR"). Without shading, `flink run flink-jobs.jar` would fail
+        with ClassNotFoundException for Kafka connector, PostgreSQL driver, etc.,
+        because those JARs are not in the Flink TaskManager's classpath.
+
+        Key settings:
+          classifier=jar-with-dependencies
+            The fat JAR is named flink-jobs-1.0-SNAPSHOT-jar-with-dependencies.jar.
+            The original thin JAR (no deps) is still produced as flink-jobs-1.0-SNAPSHOT.jar.
+
+          mainClass=(empty)
+            We do NOT set a global main class — instead we pass
+            `--class com.example.RawSinkJob` when submitting via `flink run`.
+            This lets the same fat JAR host multiple job entry points.
+
+          mergeServiceFiles
+            Some libraries (e.g. protobuf) use META-INF/services for service
+            discovery. The shade plugin merges these files from all JARs so
+            no service provider is silently dropped during shading.
+
+          relocations (none here)
+            We deliberately do NOT relocate (shade) packages such as
+            com.google.protobuf. Relocation renames classes to avoid conflicts
+            (e.g. com.google.protobuf → com.example.shaded.protobuf). It is
+            needed when the cluster ships a DIFFERENT version of the same class.
+            Flink 1.18 does not bundle protobuf 3.x by default, so no
+            relocation is needed. If you see "Class cast exception: protobuf
+            Message cannot be cast to Message" at runtime, add relocation.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.2</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <shadedArtifactAttached>true</shadedArtifactAttached>
+              <shadedClassifierName>jar-with-dependencies</shadedClassifierName>
+              <transformers>
+                <!-- ManifestResourceTransformer with an empty mainClass writes
+                     a MANIFEST.MF without a Main-Class attribute. Flink ignores
+                     the manifest and uses --class from the CLI. -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass></mainClass>
+                </transformer>
+                <!-- ServicesResourceTransformer merges META-INF/services/* files
+                     from all JARs. Required for protobuf and SPI-based libs. -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+              <filters>
+                <!-- Strip cryptographic signature files from dependency JARs.
+                     Shading changes the JAR bytes, which invalidates the original
+                     signatures and causes SecurityException at runtime. -->
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+    </plugins>
+  </build>
+
+</project>
