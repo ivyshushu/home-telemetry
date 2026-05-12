@@ -166,6 +166,68 @@
       <version>2.17.0</version>
     </dependency>
 
+    <!-- ==========================================================
+         TEST DEPENDENCIES
+         ========================================================== -->
+
+    <!--
+      JUnit 5 (Jupiter) — the test framework used by all three test classes.
+      The aggregator artifact pulls in junit-jupiter-api (for @Test, assertions,
+      etc.) and junit-jupiter-engine (the runtime that discovers and runs tests).
+      scope=test means it is compiled and run in tests only, never bundled in the
+      fat JAR.
+    -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      flink-test-utils provides MiniClusterWithClientResource (a JUnit rule that
+      starts an in-process Flink cluster) and helper utilities like
+      AbstractTestBase. Not strictly needed for operator-harness tests but it
+      pulls in logging setup that prevents spurious SLF4J "no binding" warnings
+      during test runs.
+    -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-test-utils</artifactId>
+      <version>${flink.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      The *tests* classifier JAR from flink-streaming-java ships the operator
+      test harnesses:
+        - OneInputStreamOperatorTestHarness
+        - KeyedOneInputStreamOperatorTestHarness
+      These let us drive a single operator (e.g. KeyedProcessOperator wrapping
+      AlertDetector) without a full Flink cluster, making tests fast and
+      deterministic.
+    -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-streaming-java</artifactId>
+      <version>${flink.version}</version>
+      <classifier>tests</classifier>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      flink-runtime is needed at test scope so KeyedProcessOperator and the
+      in-process state backend (HashMapStateBackend) can be instantiated without
+      a running Flink cluster. It is "provided" in production (the cluster ships
+      it), but the test harnesses need it on the test classpath.
+    -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-runtime</artifactId>
+      <version>${flink.version}</version>
+      <scope>test</scope>
+    </dependency>
+
   </dependencies>
 
   <build>
@@ -184,6 +246,20 @@
           <source>${java.version}</source>
           <target>${java.version}</target>
         </configuration>
+      </plugin>
+
+      <!--
+        Maven Surefire Plugin 3.x is required to discover and run JUnit 5 tests.
+        The default Surefire version bundled with Maven 3.x only supports JUnit 4.
+        Without this declaration, `mvn test` would silently find zero tests.
+
+        Version 3.2.5 auto-configures the JUnit Platform launcher; no extra
+        configuration is needed beyond declaring this plugin.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
       </plugin>
 
       <!--
