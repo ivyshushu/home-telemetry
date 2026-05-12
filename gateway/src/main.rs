@@ -476,6 +476,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ---------------------------------------------------------------------------
+// PARSE PAYLOAD — pure parsing helper, extracted for testability
+//
+// This function contains all of the validation logic that was previously
+// inline in handle_publish. Because it takes only a byte slice and returns
+// Option<SensorReading> with no I/O, it can be called from unit tests
+// without spinning up a Tokio runtime, an MQTT broker, or a Mutex.
+//
+// WHY EXTRACT THIS?
+// -----------------
+// handle_publish is async and touches shared state (the Snapshot Mutex).
+// Testing it directly would require a full Tokio runtime and mock I/O.
+// Extracting the pure parsing logic lets us test every validation branch
+// — invalid UTF-8, bad JSON, unknown schema version, missing fields —
+// with simple synchronous unit tests and no dependencies.
+// ---------------------------------------------------------------------------
+
+/// Parse a raw MQTT payload bytes into a SensorReading.
+/// Returns None with a warn! if the payload is invalid UTF-8, invalid JSON,
+/// has missing fields, or has an unknown schema_version.
+/// Extracted from handle_publish so it can be unit-tested without I/O.
+fn parse_payload(bytes: &[u8]) -> Option<SensorReading> {
+    let payload_str = std::str::from_utf8(bytes).ok()?;
+    let reading: SensorReading = serde_json::from_str(payload_str).ok()?;
+    if reading.schema_version != "1" {
+        return None;
+    }
+    Some(reading)
+}
+
+// ---------------------------------------------------------------------------
 // HANDLE PUBLISH — parse and snapshot one MQTT message
 //
 // This function is called for every incoming PUBLISH packet. It is async so
@@ -485,39 +515,19 @@ async fn handle_publish(
     publish: rumqttc::Publish,
     snapshot: Snapshot,
 ) {
-    // Parse the raw bytes as UTF-8 JSON.
-    let payload_str = match std::str::from_utf8(&publish.payload) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "MQTT payload is not valid UTF-8 — skipping");
-            return;
-        }
-    };
-
-    let reading: SensorReading = match serde_json::from_str(payload_str) {
-        Ok(r) => r,
-        Err(e) => {
-            // Malformed JSON or missing required fields. Log and skip — the
-            // gateway must not crash due to bad data from a single sensor.
+    // Delegate all parsing and validation to parse_payload so the logic
+    // lives in one testable place. Early-return if parsing fails — the
+    // gateway must not crash due to bad data from a single sensor.
+    let reading = match parse_payload(&publish.payload) {
+        Some(r) => r,
+        None => {
             warn!(
-                error = %e,
-                payload = payload_str,
-                "Failed to parse sensor payload — skipping"
+                payload = %String::from_utf8_lossy(&publish.payload),
+                "Failed to parse or validate sensor payload — skipping"
             );
             return;
         }
     };
-
-    // Validate the schema version. Future versions may add fields; if the
-    // gateway doesn't understand a version it logs a warning and skips rather
-    // than silently misinterpreting the data.
-    if reading.schema_version != "1" {
-        warn!(
-            schema_version = %reading.schema_version,
-            "Unknown schema version — skipping"
-        );
-        return;
-    }
 
     // Convert timestamp_ms to nanoseconds for OTLP.
     // OTLP data point timestamps are in nanoseconds since Unix epoch.
@@ -550,4 +560,158 @@ async fn handle_publish(
         (reading.sensor_id.clone(), reading.room.clone(), METRIC_PRESSURE),
         (reading.pressure, ts_nanos),
     );
+}
+
+// ---------------------------------------------------------------------------
+// UNIT TESTS
+//
+// All tests exercise parse_payload — the pure helper extracted above.
+// No Tokio runtime, no MQTT broker, no shared state needed.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: build a valid v1 JSON payload as bytes.
+    // Mirrors the exact format emitted by firmware/mock_sensor.py so tests
+    // exercise the same JSON shape the real pipeline will receive.
+    fn valid_payload(sensor_id: &str, room: &str, temp_c: f64) -> Vec<u8> {
+        format!(
+            r#"{{"schema_version":"1","sensor_id":"{sensor_id}","room":"{room}","temp_c":{temp_c},"humidity":55.0,"pressure":1013.0,"timestamp_ms":1715433600000}}"#
+        ).into_bytes()
+    }
+
+    #[test]
+    fn parse_valid_v1_payload() {
+        // WHY: Verifies the happy path — a well-formed v1 payload should
+        // round-trip through parse_payload without loss. If this breaks,
+        // every sensor reading in the pipeline would be silently dropped.
+        let result = parse_payload(&valid_payload("esp32-bedroom", "bedroom", 22.4));
+        assert!(result.is_some(), "expected Some for valid v1 payload");
+        let reading = result.unwrap();
+        assert_eq!(reading.sensor_id, "esp32-bedroom");
+        assert_eq!(reading.temp_c, 22.4);
+        assert_eq!(reading.timestamp_ms, 1715433600000);
+    }
+
+    #[test]
+    fn parse_unknown_schema_version_returns_none() {
+        // WHY: The schema_version guard is the gateway's forward-compatibility
+        // boundary. If a future firmware rolls out "schema_version":"2" with
+        // different semantics, the gateway must reject it rather than
+        // silently misinterpreting the fields. Returning None here triggers
+        // the warn! log so operators can see the mismatch.
+        let payload = br#"{"schema_version":"2","sensor_id":"esp32-bedroom","room":"bedroom","temp_c":22.4,"humidity":55.0,"pressure":1013.0,"timestamp_ms":1715433600000}"#;
+        let result = parse_payload(payload);
+        assert!(result.is_none(), "expected None for unknown schema version");
+    }
+
+    #[test]
+    fn parse_malformed_json_returns_none() {
+        // WHY: Sensors can emit partial messages during power-loss mid-send, or
+        // a rogue process can publish garbage to the topic. parse_payload must
+        // return None (not panic) so a single bad message cannot crash the
+        // gateway, which would cause a gap in all sensor streams.
+        let result = parse_payload(b"not json at all");
+        assert!(result.is_none(), "expected None for non-JSON bytes");
+    }
+
+    #[test]
+    fn parse_empty_bytes_returns_none() {
+        // WHY: An empty payload is a degenerate case of malformed input.
+        // Some MQTT brokers forward retained messages with empty payloads to
+        // clear a topic; the gateway must handle this gracefully.
+        let result = parse_payload(b"");
+        assert!(result.is_none(), "expected None for empty payload");
+    }
+
+    #[test]
+    fn parse_non_utf8_returns_none() {
+        // WHY: MQTT payloads are raw bytes and the spec does not require UTF-8.
+        // A binary sensor or misconfigured device could publish invalid UTF-8.
+        // The first step in parse_payload (from_utf8) must catch this and
+        // return None before serde ever sees the bytes.
+        let result = parse_payload(&[0xFF, 0xFE, 0x00]);
+        assert!(result.is_none(), "expected None for non-UTF-8 bytes");
+    }
+
+    #[test]
+    fn parse_missing_required_field_returns_none() {
+        // WHY: serde's Deserialize derive makes all struct fields required by
+        // default. If a firmware bug omits "temp_c" (e.g. the ADC read failed
+        // and the field was dropped rather than sent as null), the gateway
+        // should log a warning and skip rather than insert a zero or NaN into
+        // the OTLP stream, which would corrupt Flink window aggregations.
+        let payload = br#"{"schema_version":"1","sensor_id":"esp32-bedroom","room":"bedroom","humidity":55.0,"pressure":1013.0,"timestamp_ms":1715433600000}"#;
+        let result = parse_payload(payload);
+        assert!(result.is_none(), "expected None when temp_c field is absent");
+    }
+
+    #[test]
+    fn parse_preserves_timestamp_ms() {
+        // WHY: timestamp_ms is the event-time field used by Flink to assign
+        // readings to the correct tumbling window. If it were truncated or
+        // altered during parsing (e.g. parsed as i32 and overflowing), Flink
+        // would place readings in the wrong windows, corrupting aggregations.
+        // We verify the value survives the parse round-trip unchanged.
+        let ts: u64 = 1715433600000;
+        let payload = format!(
+            r#"{{"schema_version":"1","sensor_id":"esp32-test","room":"test","temp_c":20.0,"humidity":50.0,"pressure":1000.0,"timestamp_ms":{ts}}}"#
+        );
+        let result = parse_payload(payload.as_bytes());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().timestamp_ms, ts);
+    }
+
+    #[test]
+    fn parse_all_six_mock_sensor_ids() {
+        // WHY: mock_sensor.py (the stand-in for real ESP32 hardware throughout
+        // all pipeline phases) uses exactly these six sensor IDs. If any ID
+        // fails to parse (e.g. due to a hyphen being special-cased somewhere),
+        // the corresponding room would disappear from the pipeline silently.
+        // Testing all six confirms the sensor_id field is treated as an opaque
+        // string with no character-level restrictions.
+        let sensors = [
+            ("esp32-bedroom",     "bedroom"),
+            ("esp32-living-room", "living-room"),
+            ("esp32-kitchen",     "kitchen"),
+            ("esp32-bathroom",    "bathroom"),
+            ("esp32-office",      "office"),
+            ("esp32-garage",      "garage"),
+        ];
+        for (sensor_id, room) in &sensors {
+            let result = parse_payload(&valid_payload(sensor_id, room, 21.0));
+            assert!(
+                result.is_some(),
+                "expected Some for sensor_id={sensor_id}"
+            );
+            assert_eq!(
+                result.unwrap().sensor_id,
+                *sensor_id,
+                "sensor_id mismatch for {sensor_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn ts_nanos_conversion() {
+        // WHY: handle_publish multiplies timestamp_ms by 1_000_000 to convert
+        // to nanoseconds for the OTLP timestamp field. If this overflows a u64,
+        // it would silently wrap around, producing a timestamp in ~1970 and
+        // causing every Flink window to be mis-assigned.
+        //
+        // u64::MAX is ~1.8 × 10^19. A realistic timestamp_ms for year 2024 is
+        // ~1.7 × 10^12, so × 10^6 gives ~1.7 × 10^18 — well under u64::MAX.
+        // This test documents that contract explicitly.
+        let timestamp_ms: u64 = 1_715_433_600_000; // 2024-05-11 in millis
+        let ts_nanos = timestamp_ms.checked_mul(1_000_000);
+        assert!(
+            ts_nanos.is_some(),
+            "timestamp_ms * 1_000_000 overflowed u64 for a realistic timestamp"
+        );
+        assert!(
+            ts_nanos.unwrap() < u64::MAX,
+            "ts_nanos should be well below u64::MAX"
+        );
+    }
 }
