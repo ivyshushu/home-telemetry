@@ -1,0 +1,61 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition = "2021"
+
+# WHY RUST?
+# ---------
+# This gateway mirrors the onboard data-collector agent in a real EV telematics
+# system. EV gateways (think: the ECU software that aggregates CAN-bus, LiDAR,
+# and thermal sensor data before forwarding to the cloud) are written in C or Rust
+# because they run on constrained hardware and must never crash due to memory bugs.
+# Rust gives us memory safety without garbage-collection pauses — ideal for a
+# long-running service on a Raspberry Pi or automotive SoC.
+
+[dependencies]
+
+# MQTT CLIENT
+# -----------
+# rumqttc is a pure-Rust, async-native MQTT 3.1.1 client built on top of tokio.
+# It handles reconnection, QoS ack tracking, and the async event loop.
+# "0.24" is the current stable release and works well with tokio 1.x.
+rumqttc = "0.24"
+
+# JSON (de)serialization — the v1 sensor payload is plain JSON.
+# The `derive` feature enables #[derive(Deserialize)] on our SensorReading struct.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ASYNC RUNTIME
+# -------------
+# tokio is the de-facto async runtime for Rust. "full" enables the complete
+# feature set (timers, file I/O, sync primitives, macros like #[tokio::main]).
+# In a production gateway you might use a minimal feature set to reduce binary size.
+tokio = { version = "1", features = ["full"] }
+
+# OPENTELEMETRY
+# -------------
+# opentelemetry — the core API (traits, types, KeyValue). Consumers of metrics
+#   (like our code) program to this API; the SDK underneath does the work.
+# opentelemetry_sdk — the SDK that implements the API. "rt-tokio" makes the
+#   periodic exporter run on the tokio scheduler instead of spinning a new thread.
+# opentelemetry-otlp — the OTLP exporter that serialises metrics as protobuf and
+#   sends them over gRPC to the OTel Collector. "grpc-tonic" selects tonic as the
+#   gRPC transport (the other option is grpc-tungstenite for HTTP/2 without gRPC).
+opentelemetry = { version = "0.22", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.22", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.15", features = ["grpc-tonic", "metrics"] }
+opentelemetry-semantic-conventions = "0.14"
+
+# tonic is the gRPC runtime used internally by opentelemetry-otlp.
+# We also depend on it directly for its transport types (e.g. Endpoint).
+tonic = "0.11"
+
+# LOGGING / TRACING
+# -----------------
+# tracing — a structured logging and diagnostic framework for async Rust.
+#   Unlike std::log, tracing understands that work spans multiple async tasks.
+# tracing-subscriber — collects tracing events and formats them to stdout.
+#   "env-filter" lets you set log level via RUST_LOG=gateway=debug.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
