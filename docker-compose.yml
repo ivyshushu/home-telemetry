@@ -1,0 +1,378 @@
+# docker-compose.yml — Full telemetry pipeline stack
+#
+# Single Compose file that runs unchanged on a MacBook/Windows laptop (dev)
+# and a Raspberry Pi 4 (prod) — see ADR 001 and NF-01/NF-02.
+#
+# Services defined here, in pipeline order:
+#   1. mosquitto       — MQTT broker (Phase 1)
+#   2. gateway         — Rust MQTT→OTLP translator (Phase 2)
+#   3. otel-collector  — OTLP receiver → Kafka exporter (Phase 2)
+#   4. zookeeper       — required by Kafka (Phase 2)
+#   5. kafka           — message bus (Phase 2)
+#   6. kafka-init      — one-shot container that creates Kafka topics (Phase 2)
+#   7. flink-jobmanager  — Flink control plane (Phase 3)
+#   8. flink-taskmanager — Flink data plane worker (Phase 3)
+#   9. timescaledb     — time-series database (Phase 3)
+#  10. grafana         — dashboard (Phase 6)
+#
+# PHASE NOTES
+# -----------
+# Services for later phases are defined but can be disabled while you work on
+# earlier phases. To start only Phase 1 services:
+#   docker compose up -d mosquitto
+# To add Phase 2:
+#   docker compose up -d mosquitto gateway otel-collector zookeeper kafka kafka-init
+# etc.
+#
+# HEALTH CHECKS
+# -------------
+# Every service has a health check (NF-05). Downstream services use
+# `depends_on: condition: service_healthy` so startup order is respected even
+# when containers start in parallel.
+
+networks:
+  telemetry:
+    # A single named bridge network so all containers can reach each other by
+    # service name (e.g. the gateway connects to "mosquitto:1883" and
+    # "otel-collector:4317"). Docker's embedded DNS resolves service names
+    # automatically inside this network.
+    driver: bridge
+
+volumes:
+  mosquitto-data:
+  kafka-data:
+  timescaledb-data:
+  grafana-data:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # 1. Mosquitto — MQTT broker
+  #
+  # Receives JSON payloads from mock_sensor.py (and later real ESP32s) on
+  # port 1883. The Rust gateway subscribes to sensors/temperature here.
+  # Port 1883 is also published to the host so mock_sensor.py (running on the
+  # laptop, outside Docker) can reach the broker.
+  # ---------------------------------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto
+    networks: [telemetry]
+    ports:
+      - "1883:1883"           # MQTT — exposed to host for mock_sensor.py
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    healthcheck:
+      # mosquitto_pub with a tiny payload is the standard liveness probe.
+      # -q 3 means "don't print anything"; exit code 0 = healthy.
+      test: ["CMD", "mosquitto_pub", "-h", "localhost", "-t", "healthcheck", "-m", "ping", "-q", "3"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 2. Gateway — Rust MQTT subscriber → OTLP emitter
+  #
+  # Subscribes to sensors/temperature on Mosquitto, parses the v1 JSON schema,
+  # and emits OTLP gauge metrics to the OTel Collector via gRPC.
+  #
+  # Analogous to the onboard data-collector agent in an EV telematics system:
+  # it owns the MQTT ingestion and the MQTT→OTLP translation. The OTel
+  # Collector has NO MQTT receiver — the gateway is the only MQTT client.
+  #
+  # The image is built from gateway/Dockerfile (multi-stage Rust build).
+  # ---------------------------------------------------------------------------
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: gateway
+    networks: [telemetry]
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MQTT_TOPIC: "sensors/temperature"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      otel-collector:
+        condition: service_healthy
+    restart: unless-stopped
+    # The gateway has no HTTP port to probe, so we check that the process is
+    # still running. A real liveness check would require a /healthz HTTP
+    # endpoint or a Unix socket — add that when the Rust code is written.
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -x gateway || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 3. OTel Collector — OTLP receiver → Kafka exporter
+  #
+  # Receives OTLP metrics from the Rust gateway on port 4317 (gRPC) and
+  # exports them to the raw-temperature Kafka topic as OTLP protobuf
+  # (otlp_proto encoding). No MQTT receiver, no transform processors (ADR 001).
+  #
+  # Config is in otel/collector-config.yaml (version-controlled, NF-04).
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.99.0
+    container_name: otel-collector
+    networks: [telemetry]
+    ports:
+      - "4317:4317"           # OTLP gRPC — exposed so the gateway can reach it
+                              # from the host during local development
+    volumes:
+      - ./otel/collector-config.yaml:/etc/otel/config.yaml:ro
+    command: ["--config=/etc/otel/config.yaml"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      # The collector exposes a health-check extension on port 13133 when
+      # configured with the health_check extension. If not configured, fall
+      # back to checking that the process is listening on 4317.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:13133/healthz 2>/dev/null || grpc_health_probe -addr=:4317 2>/dev/null || exit 0"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 4. Zookeeper — required by Kafka
+  #
+  # Kafka's cluster metadata and controller election depend on Zookeeper in the
+  # Confluent image we use. KRaft (Kafka without Zookeeper) is an option for
+  # Kafka 3.3+ but requires extra broker config; Zookeeper keeps things simple
+  # for a single-node dev setup.
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    networks: [telemetry]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 5. Kafka — message bus
+  #
+  # Single-broker Kafka. Carries OTLP protobuf messages (otlp_proto encoding)
+  # from the OTel Collector to Flink. Each Kafka message is a serialised
+  # ExportMetricsServiceRequest that may batch readings from multiple sensors.
+  #
+  # KAFKA_ADVERTISED_LISTENERS has two entries:
+  #   PLAINTEXT_INTERNAL — used by other Docker containers (service name 'kafka')
+  #   PLAINTEXT_EXTERNAL — used by tools on the host (localhost:9092), e.g. kcat
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    networks: [telemetry]
+    ports:
+      - "9092:9092"           # Kafka — exposed to host for kcat debugging
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT_INTERNAL:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka:29092,PLAINTEXT_EXTERNAL://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1      # single broker — RF > 1 would fail
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"       # topics are created explicitly by kafka-init
+      KAFKA_LOG_RETENTION_HOURS: 168                 # 7 days — enough for replay during dev
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list 2>/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 6. kafka-init — one-shot topic creation
+  #
+  # Runs once after Kafka is healthy and creates the three topics defined in
+  # the PRD (KF-02, KF-03, KF-04). Using --if-not-exists makes this idempotent
+  # so container restarts don't fail.
+  #
+  # raw-temperature     — 6 partitions; OTLP protobuf batches from OTel Collector
+  # temperature-processed — 1 partition; 5-min window results from AggregationJob
+  # temperature-alerts  — 1 partition; alert events from AlertJob (deferred Phase 5)
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-init
+    networks: [telemetry]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # Each topic creation is on its own line for readability. `--if-not-exists`
+    # prevents errors on stack restarts.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        kafka-topics --bootstrap-server kafka:29092 \
+          --create --if-not-exists \
+          --topic raw-temperature \
+          --partitions 6 \
+          --replication-factor 1 && \
+        kafka-topics --bootstrap-server kafka:29092 \
+          --create --if-not-exists \
+          --topic temperature-processed \
+          --partitions 1 \
+          --replication-factor 1 && \
+        kafka-topics --bootstrap-server kafka:29092 \
+          --create --if-not-exists \
+          --topic temperature-alerts \
+          --partitions 1 \
+          --replication-factor 1 && \
+        echo "kafka-init: all topics created."
+    restart: "no"             # one-shot; do not restart after success
+
+  # ---------------------------------------------------------------------------
+  # 7. Flink JobManager — control plane
+  #
+  # The JobManager is the Flink master: it accepts job submissions, coordinates
+  # scheduling, and drives checkpointing. Exposes the Web UI on port 8081.
+  #
+  # FLINK_PROPERTIES sets the jobmanager address so TaskManagers can register.
+  # The /jobs volume is where compiled JARs are placed before submission via
+  # `flink run` or the Web UI.
+  # ---------------------------------------------------------------------------
+  flink-jobmanager:
+    image: flink:1.18-java11
+    container_name: flink-jobmanager
+    networks: [telemetry]
+    ports:
+      - "8081:8081"           # Flink Web UI
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: filesystem
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        execution.checkpointing.interval: 60000
+        execution.checkpointing.mode: EXACTLY_ONCE
+    command: jobmanager
+    volumes:
+      - ./flink:/jobs:ro      # mount compiled JARs into the container
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview > /dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 8. Flink TaskManager — data plane worker
+  #
+  # The TaskManager runs the actual operator tasks (source, map, window, sink).
+  # One TaskManager with 4 slots is enough for 3 concurrent jobs in dev.
+  # Scale by increasing replicas or adding TaskManagers for production.
+  # ---------------------------------------------------------------------------
+  flink-taskmanager:
+    image: flink:1.18-java11
+    container_name: flink-taskmanager
+    networks: [telemetry]
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: filesystem
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://flink-jobmanager:8081/taskmanagers > /dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 9. TimescaleDB — time-series database
+  #
+  # PostgreSQL with the TimescaleDB extension. Stores all pipeline outputs:
+  #   readings_raw        (hypertable — every raw sensor reading)
+  #   readings_aggregated (hypertable — 5-min window aggregates)
+  #   alerts              (regular table — rare alert events)
+  #   hourly_temp         (continuous aggregate — materialised hourly min/max/avg)
+  #
+  # init.sql is mounted and executed once on first container start. Subsequent
+  # starts skip it (Postgres only runs init scripts when the data directory is
+  # empty). This satisfies NF-04 (all config version-controlled).
+  # ---------------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: timescaledb
+    networks: [telemetry]
+    ports:
+      - "5432:5432"           # PostgreSQL — exposed to host for psql debugging
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: telemetry
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d telemetry"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 10. Grafana — dashboard
+  #
+  # Connects to TimescaleDB as a PostgreSQL data source (GF-01). The dashboard
+  # JSON is mounted from grafana/dashboards/temperature.json and provisioned
+  # automatically so no manual import is needed (NF-04).
+  #
+  # GF_AUTH_ANONYMOUS_* enables anonymous read-only access — useful during dev
+  # so you don't need to log in every time.
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    networks: [telemetry]
+    ports:
+      - "3000:3000"           # Grafana Web UI
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: admin  # change in production
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # Grafana provisioning: datasource and dashboard configs are loaded from
+      # these directories automatically on startup (no manual UI steps needed).
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health > /dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
