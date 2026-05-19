@@ -2,7 +2,8 @@ package com.example;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -332,17 +333,11 @@ public class AlertJob {
      * so 1-to-1 is correct here. The OtlpDeserializer for {@code raw-temperature}
      * needed 1-to-many because one OTLP batch could contain multiple sensor readings.
      */
-    public static class WindowResultDeserializer implements DeserializationSchema<WindowResult> {
+    public static class WindowResultDeserializer implements KafkaRecordDeserializationSchema<WindowResult> {
 
         @Override
-        public WindowResult deserialize(byte[] bytes) throws IOException {
-            return JSON.readValue(bytes, WindowResult.class);
-        }
-
-        /** Returns false — this is an unbounded stream, never end-of-stream. */
-        @Override
-        public boolean isEndOfStream(WindowResult result) {
-            return false;
+        public void deserialize(ConsumerRecord<byte[], byte[]> record, Collector<WindowResult> out) throws IOException {
+            out.collect(JSON.readValue(record.value(), WindowResult.class));
         }
 
         @Override

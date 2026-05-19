@@ -274,8 +274,8 @@
             The original thin JAR (no deps) is still produced as flink-jobs-1.0-SNAPSHOT.jar.
 
           mainClass=(empty)
-            We do NOT set a global main class — instead we pass
-            `--class com.example.RawSinkJob` when submitting via `flink run`.
+            We do NOT set a global main class. Instead we pass the class name
+            via "flink run -c com.example.RawSinkJob" at submission time.
             This lets the same fat JAR host multiple job entry points.
 
           mergeServiceFiles
@@ -308,7 +308,7 @@
               <transformers>
                 <!-- ManifestResourceTransformer with an empty mainClass writes
                      a MANIFEST.MF without a Main-Class attribute. Flink ignores
-                     the manifest and uses --class from the CLI. -->
+                     the manifest and uses the -c flag from the CLI. -->
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                   <mainClass></mainClass>
                 </transformer>

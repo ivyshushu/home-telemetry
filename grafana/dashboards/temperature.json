@@ -1,0 +1,240 @@
+{
+  "id": null,
+  "uid": "room-temperature-v1",
+  "title": "Room Temperature Telemetry",
+  "tags": ["temperature", "iot", "timescaledb"],
+  "style": "dark",
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "version": 1,
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+        "definition": "SELECT DISTINCT room FROM readings_raw ORDER BY 1",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Room",
+        "multi": true,
+        "name": "room",
+        "options": [],
+        "query": "SELECT DISTINCT room FROM readings_raw ORDER BY 1",
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Current Temperature",
+      "description": "Latest reading per room. Color: blue < 18 °C, green 18–24, yellow 24–27, red > 27.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "/^Temp/",
+          "values": true
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "decimals": 1,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue",   "value": null },
+              { "color": "green",  "value": 18   },
+              { "color": "yellow", "value": 24   },
+              { "color": "red",    "value": 27   }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+          "rawSql": "SELECT DISTINCT ON (room)\n  time,\n  room AS \"Room\",\n  round(temp_c::numeric, 1) AS \"Temp °C\"\nFROM readings_raw\nWHERE room IN ($room)\nORDER BY room, time DESC",
+          "rawQuery": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Temperature – Raw Readings (1-min buckets)",
+      "description": "1-minute averages from readings_raw. Shows all 6 sensors at 10-second cadence, smoothed to 1-minute for readability.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "none" },
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": {
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+          "rawSql": "SELECT\n  time_bucket('1 minute', time) AS time,\n  room AS metric,\n  round(avg(temp_c)::numeric, 2) AS value\nFROM readings_raw\nWHERE room IN ($room)\n  AND $__timeFilter(time)\nGROUP BY 1, 2\nORDER BY 1",
+          "rawQuery": true,
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "5-min Window Avg / Max",
+      "description": "Written by Flink AggregationJob. One point per room per 5-minute tumbling window. Empty until AggregationJob is submitted.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "none" },
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": {
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+          "rawSql": "SELECT\n  bucket AS time,\n  room || ' avg' AS metric,\n  round(avg_temp::numeric, 2) AS value\nFROM readings_aggregated\nWHERE room IN ($room)\n  AND $__timeFilter(bucket)\nORDER BY bucket",
+          "rawQuery": true,
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+          "rawSql": "SELECT\n  bucket AS time,\n  room || ' max' AS metric,\n  round(max_temp::numeric, 2) AS value\nFROM readings_aggregated\nWHERE room IN ($room)\n  AND $__timeFilter(bucket)\nORDER BY bucket",
+          "rawQuery": true,
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Hourly Temperature Heatmap",
+      "description": "Temperature distribution per hour from the hourly_temp continuous aggregate. Darker = hotter. Requires at least 1 hour of data.",
+      "type": "heatmap",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+      "options": {
+        "calculate": false,
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "reverse": true,
+          "steps": 128
+        },
+        "yAxis": { "unit": "celsius", "decimals": 1 },
+        "tooltip": { "show": true, "yHistogram": false },
+        "legend": { "show": true }
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "celsius" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+          "rawSql": "SELECT\n  bucket AS time,\n  room AS metric,\n  round(avg_temp::numeric, 2) AS value\nFROM hourly_temp\nWHERE room IN ($room)\n  AND $__timeFilter(bucket)\nORDER BY bucket",
+          "rawQuery": true,
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Alert Log",
+      "description": "Rows appear when max_temp exceeds 25 °C for 3 consecutive 5-min windows. Written by Flink AlertJob.",
+      "type": "table",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "Time", "desc": true }]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "displayMode": "auto" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Max Temp (°C)" },
+            "properties": [{ "id": "unit", "value": "celsius" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Time" },
+            "properties": [{ "id": "custom.width", "value": 200 }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "dfmh9yr5kulfka" },
+          "rawSql": "SELECT\n  time AS \"Time\",\n  room AS \"Room\",\n  round(max_temp::numeric, 1) AS \"Max Temp (°C)\",\n  consecutive_count AS \"Consecutive Windows\",\n  window_start AS \"Window Start\"\nFROM alerts\nWHERE $__timeFilter(time)\nORDER BY time DESC\nLIMIT 100",
+          "rawQuery": true,
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}

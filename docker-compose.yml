@@ -66,7 +66,7 @@ services:
     healthcheck:
       # mosquitto_pub with a tiny payload is the standard liveness probe.
       # -q 3 means "don't print anything"; exit code 0 = healthy.
-      test: ["CMD", "mosquitto_pub", "-h", "localhost", "-t", "healthcheck", "-m", "ping", "-q", "3"]
+      test: ["CMD", "mosquitto_pub", "-h", "localhost", "-t", "healthcheck", "-m", "ping", "-q", "0"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -99,7 +99,7 @@ services:
       mosquitto:
         condition: service_healthy
       otel-collector:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
     # The gateway has no HTTP port to probe, so we check that the process is
     # still running. A real liveness check would require a /healthz HTTP
@@ -132,14 +132,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    healthcheck:
-      # The collector exposes a health-check extension on port 13133 when
-      # configured with the health_check extension. If not configured, fall
-      # back to checking that the process is listening on 4317.
-      test: ["CMD-SHELL", "wget -qO- http://localhost:13133/healthz 2>/dev/null || grpc_health_probe -addr=:4317 2>/dev/null || exit 0"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
+    # The otel-collector-contrib image is distroless (no shell, no wget, no nc),
+    # so a CMD-SHELL healthcheck is impossible. The gateway retries OTLP
+    # connections on its own, so service_started is sufficient.
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
@@ -158,7 +153,7 @@ services:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      test: ["CMD-SHELL", "echo srvr | nc localhost 2181 | grep -q Mode"]
       interval: 10s
       timeout: 5s
       retries: 5

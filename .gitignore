@@ -17,3 +17,5 @@ __pycache__/
 
 # Claude Code internals
 .agents/
+
+.DS_Store

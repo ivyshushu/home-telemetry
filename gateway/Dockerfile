@@ -7,13 +7,13 @@
 # copy only the stripped binary into a minimal runtime image (~100 MB).
 # On a Raspberry Pi 4 with limited flash storage this matters.
 #
-# Stage 1: rust:1.77-slim  — has rustc, cargo, and build tools
+# Stage 1: rust:1.85-slim  — has rustc, cargo, and build tools
 # Stage 2: debian:bookworm-slim — has only libc and ca-certificates
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1 — Build
 # ─────────────────────────────────────────────────────────────────────────────
-FROM rust:1.77-slim AS builder
+FROM rust:1.85-slim AS builder
 
 WORKDIR /app
 

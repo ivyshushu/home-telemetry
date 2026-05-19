@@ -91,7 +91,7 @@ Validates that mock sensors publish correctly before any backend is involved.
 docker compose up -d mosquitto
 
 # In a separate terminal, subscribe to all sensor topics to watch the stream
-mosquitto_sub -h localhost -t "sensors/#" -v
+docker exec -it mosquitto mosquitto_sub -t "sensors/#" -v
 
 # Start the mock sensors (6 simulated ESP32s, one message per sensor every 10 s)
 python firmware/mock_sensor.py
@@ -124,14 +124,14 @@ docker compose logs -f gateway
 docker compose logs -f otel-collector
 
 # Confirm the raw-temperature topic is receiving messages
-kcat -b localhost:9092 -t raw-temperature -C
+docker exec kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic raw-temperature --from-beginning
 ```
 
 Validate topic setup:
 
 ```bash
 # List topics — should show raw-temperature (6 partitions), temperature-processed, temperature-alerts
-kcat -b localhost:9092 -L
+docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list
 ```
 
 ---
@@ -149,8 +149,8 @@ cd flink && mvn clean package -DskipTests && cd ..
 
 # Submit RawSinkJob
 docker exec flink-jobmanager flink run \
-  /jobs/flink-jobs.jar \
-  --class com.example.RawSinkJob
+  -c com.example.RawSinkJob \
+  /jobs/target/flink-jobs-1.0-SNAPSHOT-jar-with-dependencies.jar
 
 # Open the Flink Web UI to confirm the job is RUNNING
 open http://localhost:8081
@@ -183,8 +183,8 @@ Computes 5-minute tumbling windows per room; writes to TimescaleDB and Kafka.
 
 ```bash
 docker exec flink-jobmanager flink run \
-  /jobs/flink-jobs.jar \
-  --class com.example.AggregationJob
+  -c com.example.AggregationJob \
+  /jobs/target/flink-jobs-1.0-SNAPSHOT-jar-with-dependencies.jar
 ```
 
 Wait 5 minutes (one full window), then validate:
@@ -199,7 +199,7 @@ SELECT * FROM readings_aggregated ORDER BY bucket DESC LIMIT 12;
 SELECT DISTINCT room FROM readings_aggregated;
 
 -- Temperature-processed topic should have window results
-kcat -b localhost:9092 -t temperature-processed -C
+docker exec kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic temperature-processed --from-beginning
 ```
 
 The Flink Web UI should now show **2 jobs in RUNNING state**.
@@ -212,8 +212,8 @@ Fires when `max_temp` exceeds 25 °C for 3 consecutive 5-minute windows.
 
 ```bash
 docker exec flink-jobmanager flink run \
-  /jobs/flink-jobs.jar \
-  --class com.example.AlertJob
+  -c com.example.AlertJob \
+  /jobs/target/flink-jobs-1.0-SNAPSHOT-jar-with-dependencies.jar
 ```
 
 To trigger a test alert, temporarily raise the mock sensor temperature:
@@ -223,7 +223,7 @@ To trigger a test alert, temporarily raise the mock sensor temperature:
 # Restart the mock sensor and wait 3 × 5 minutes
 
 psql -h localhost -U postgres -d telemetry -c "SELECT * FROM alerts;"
-kcat -b localhost:9092 -t temperature-alerts -C
+docker exec kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic temperature-alerts --from-beginning
 ```
 
 ---
@@ -260,8 +260,8 @@ Submit all three Flink jobs:
 ```bash
 for class in RawSinkJob AggregationJob AlertJob; do
   docker exec flink-jobmanager flink run \
-    /jobs/flink-jobs.jar \
-    --class com.example.$class
+    -c com.example.$class \
+    /jobs/target/flink-jobs-1.0-SNAPSHOT-jar-with-dependencies.jar
 done
 ```
 
@@ -321,7 +321,7 @@ docker compose restart otel-collector
 docker compose logs flink-taskmanager | tail -100
 
 # Verify the JAR is accessible inside the JobManager
-docker exec flink-jobmanager ls /jobs/
+docker exec flink-jobmanager ls /jobs/target/
 
 # Resubmit via the Web UI to see the full exception in the browser
 open http://localhost:8081
@@ -342,7 +342,7 @@ docker compose logs timescaledb | tail -50
 
 ```bash
 # Save one message to a file, then decode with protoc or a Python script
-kcat -b localhost:9092 -t raw-temperature -C -c 1 -o beginning > /tmp/msg.bin
+docker exec kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic raw-temperature --from-beginning --max-messages 1 > /tmp/msg.bin
 python3 -c "
 import sys
 from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
