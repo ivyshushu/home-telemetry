@@ -3,26 +3,54 @@
 # Single Compose file that runs unchanged on a MacBook/Windows laptop (dev)
 # and a Raspberry Pi 4 (prod) — see ADR 001 and NF-01/NF-02.
 #
-# Services defined here, in pipeline order:
-#   1. mosquitto       — MQTT broker (Phase 1)
-#   2. gateway         — Rust MQTT→OTLP translator (Phase 2)
-#   3. otel-collector  — OTLP receiver → Kafka exporter (Phase 2)
-#   4. zookeeper       — required by Kafka (Phase 2)
-#   5. kafka           — message bus (Phase 2)
-#   6. kafka-init      — one-shot container that creates Kafka topics (Phase 2)
-#   7. flink-jobmanager  — Flink control plane (Phase 3)
-#   8. flink-taskmanager — Flink data plane worker (Phase 3)
-#   9. timescaledb     — time-series database (Phase 3)
-#  10. grafana         — dashboard (Phase 6)
+# Services defined here, grouped by profile:
 #
-# PHASE NOTES
-# -----------
-# Services for later phases are defined but can be disabled while you work on
-# earlier phases. To start only Phase 1 services:
-#   docker compose up -d mosquitto
-# To add Phase 2:
-#   docker compose up -d mosquitto gateway otel-collector zookeeper kafka kafka-init
-# etc.
+#   [device]
+#   1. mosquitto       — MQTT broker
+#   2. gateway         — Rust MQTT→OTLP translator
+#   3. mock-sensor     — Python script simulating 6 ESP32 sensors
+#
+#   [pi]
+#   4. otel-collector  — OTLP receiver → Kafka exporter
+#   5. zookeeper       — required by Kafka
+#   6. kafka           — message bus
+#   7. kafka-init      — one-shot container that creates Kafka topics
+#   8. flink-jobmanager  — Flink control plane
+#   9. flink-taskmanager — Flink data plane worker
+#  10. timescaledb     — time-series database
+#  11. grafana         — dashboard
+#
+# PROFILES
+# --------
+# This file uses two Docker Compose profiles so the right services run on
+# the right machine in the split-deployment case (ADR 001 / NF-02):
+#
+#   device  — mosquitto, gateway, mock-sensor
+#             Run on the ESP32 host (laptop or dedicated device)
+#
+#   pi      — otel-collector, zookeeper, kafka, kafka-init,
+#             flink-jobmanager, flink-taskmanager, timescaledb, grafana
+#             Run on the Raspberry Pi 4
+#
+# USAGE
+# -----
+# Device only (ESP32 host):
+#   docker compose --profile device up -d
+#
+# Pi only:
+#   docker compose --profile pi up -d
+#
+# All-in-one dev (single machine, both profiles):
+#   docker compose --profile device --profile pi up -d
+#
+# Device pointing at a remote Pi:
+#   OTEL_COLLECTOR_HOST=<pi-ip> docker compose --profile device up -d
+#
+# CROSS-MACHINE ENDPOINT
+# ----------------------
+# When running split across two machines, the gateway needs the Pi's real IP
+# to reach otel-collector. Set OTEL_COLLECTOR_HOST to the Pi's static IP.
+# Defaults to "otel-collector" (Docker DNS) for single-machine dev mode.
 #
 # HEALTH CHECKS
 # -------------
@@ -57,6 +85,7 @@ services:
   mosquitto:
     image: eclipse-mosquitto:2
     container_name: mosquitto
+    profiles: [device]
     networks: [telemetry]
     ports:
       - "1883:1883"           # MQTT — exposed to host for mock_sensor.py
@@ -89,17 +118,16 @@ services:
       context: ./gateway
       dockerfile: Dockerfile
     container_name: gateway
+    profiles: [device]
     networks: [telemetry]
     environment:
       MQTT_HOST: mosquitto
       MQTT_PORT: "1883"
       MQTT_TOPIC: "sensors/temperature"
-      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://${OTEL_COLLECTOR_HOST:-otel-collector}:4317"
     depends_on:
       mosquitto:
         condition: service_healthy
-      otel-collector:
-        condition: service_started
     restart: unless-stopped
     # The gateway has no HTTP port to probe, so we check that the process is
     # still running. A real liveness check would require a /healthz HTTP
@@ -111,7 +139,38 @@ services:
       retries: 5
 
   # ---------------------------------------------------------------------------
-  # 3. OTel Collector — OTLP receiver → Kafka exporter
+  # 3. mock-sensor — simulated ESP32 sensors
+  #
+  # Publishes the same JSON payload that real ESP32s will send, so every
+  # downstream component (gateway, Kafka, Flink, Grafana) can be developed and
+  # tested without physical hardware (ADR 001 / FW-05).
+  #
+  # MQTT_HOST points to the mosquitto container on the same Docker network.
+  # INTERVAL controls how often each of the 6 sensors publishes (default 10s).
+  # ---------------------------------------------------------------------------
+  mock-sensor:
+    build:
+      context: ./firmware
+      dockerfile: Dockerfile
+    container_name: mock-sensor
+    profiles: [device]
+    networks: [telemetry]
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      INTERVAL: "10"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f mock_sensor.py || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 4. OTel Collector — OTLP receiver → Kafka exporter
   #
   # Receives OTLP metrics from the Rust gateway on port 4317 (gRPC) and
   # exports them to the raw-temperature Kafka topic as OTLP protobuf
@@ -122,6 +181,7 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.99.0
     container_name: otel-collector
+    profiles: [pi]
     networks: [telemetry]
     ports:
       - "4317:4317"           # OTLP gRPC — exposed so the gateway can reach it
@@ -148,6 +208,7 @@ services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     container_name: zookeeper
+    profiles: [pi]
     networks: [telemetry]
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
@@ -173,6 +234,7 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     container_name: kafka
+    profiles: [pi]
     networks: [telemetry]
     ports:
       - "9092:9092"           # Kafka — exposed to host for kcat debugging
@@ -213,6 +275,7 @@ services:
   kafka-init:
     image: confluentinc/cp-kafka:7.6.0
     container_name: kafka-init
+    profiles: [pi]
     networks: [telemetry]
     depends_on:
       kafka:
@@ -253,6 +316,7 @@ services:
   flink-jobmanager:
     image: flink:1.18-java11
     container_name: flink-jobmanager
+    profiles: [pi]
     networks: [telemetry]
     ports:
       - "8081:8081"           # Flink Web UI
@@ -284,6 +348,7 @@ services:
   flink-taskmanager:
     image: flink:1.18-java11
     container_name: flink-taskmanager
+    profiles: [pi]
     networks: [telemetry]
     environment:
       FLINK_PROPERTIES: |
@@ -318,6 +383,7 @@ services:
   timescaledb:
     image: timescale/timescaledb:latest-pg16
     container_name: timescaledb
+    profiles: [pi]
     networks: [telemetry]
     ports:
       - "5432:5432"           # PostgreSQL — exposed to host for psql debugging
@@ -348,6 +414,7 @@ services:
   grafana:
     image: grafana/grafana:10.4.2
     container_name: grafana
+    profiles: [pi]
     networks: [telemetry]
     ports:
       - "3000:3000"           # Grafana Web UI
